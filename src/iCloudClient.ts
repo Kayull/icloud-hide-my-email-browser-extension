@@ -1,4 +1,12 @@
-export class UnsuccessfulRequestError extends Error {}
+export class UnsuccessfulRequestError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+  }
+
+  get isAuthenticationError(): boolean {
+    return [401, 403, 421, 450].includes(this.status);
+  }
+}
 
 type ServiceName = 'premiummailsettings';
 
@@ -23,13 +31,17 @@ class ICloudClient {
 
     const response = await fetch(url, {
       method,
+      credentials: 'include',
+      cache: 'no-store',
+      signal: AbortSignal.timeout(15000),
       headers,
       body: data !== undefined ? JSON.stringify(data) : undefined,
     });
 
     if (!response.ok) {
       throw new UnsuccessfulRequestError(
-        `Request to ${method} ${url} failed with status code ${response.status}`
+        `iCloud request failed (${response.status})`,
+        response.status
       );
     }
 
@@ -47,8 +59,15 @@ class ICloudClient {
     try {
       await this.validateToken();
       return true;
-    } catch {
-      return false;
+    } catch (error) {
+      if (
+        error instanceof UnsuccessfulRequestError &&
+        error.isAuthenticationError
+      ) {
+        return false;
+      }
+      // Offline, rate limiting and server failures must not erase the session.
+      throw error;
     }
   }
 
@@ -60,9 +79,10 @@ class ICloudClient {
       webservices: ICloudClient['webservices'];
     };
 
-    if (webservices) {
-      this.webservices = webservices;
+    if (!webservices?.premiummailsettings?.url) {
+      throw new Error('Hide My Email is unavailable for this iCloud account.');
     }
+    this.webservices = webservices;
   }
 
   public async signOut(

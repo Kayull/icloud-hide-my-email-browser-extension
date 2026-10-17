@@ -9,6 +9,7 @@ import ICloudClient, {
   PremiumMailSettings,
   DEFAULT_SETUP_URL,
   CN_SETUP_URL,
+  UnsuccessfulRequestError,
 } from '../../iCloudClient';
 import {
   ActiveInputElementWriteData,
@@ -27,21 +28,13 @@ import {
   SIGNED_OUT_CTA_COPY,
 } from './constants';
 import { isFirefox } from '../../browserUtils';
+import { getAuthenticatedClient } from '../../session';
 
-const constructClient = async (): Promise<ICloudClient> => {
-  const clientState = await getBrowserStorageValue('clientState');
-
-  if (clientState === undefined) {
-    console.debug('constructClient: Using default setupUrl');
-    return new ICloudClient(DEFAULT_SETUP_URL);
+const performDeauthSideEffects = async (clearSession = false) => {
+  await setBrowserStorageValue('popupState', DEFAULT_STORE.popupState);
+  if (clearSession) {
+    await setBrowserStorageValue('clientState', DEFAULT_STORE.clientState);
   }
-
-  return new ICloudClient(clientState.setupUrl, clientState.webservices);
-};
-
-const performDeauthSideEffects = () => {
-  setBrowserStorageValue('popupState', DEFAULT_STORE.popupState);
-  setBrowserStorageValue('clientState', DEFAULT_STORE.clientState);
 
   browser.contextMenus
     .update(CONTEXT_MENU_ITEM_ID, {
@@ -51,13 +44,13 @@ const performDeauthSideEffects = () => {
     .catch(console.debug);
 };
 
-const performAuthSideEffects = (
+const performAuthSideEffects = async (
   client: ICloudClient,
   options: { notification?: boolean } = {}
 ) => {
   const { notification = false } = options;
 
-  setBrowserStorageValue('clientState', {
+  await setBrowserStorageValue('clientState', {
     setupUrl: client.setupUrl,
     webservices: client.webservices,
   });
@@ -83,81 +76,76 @@ const performAuthSideEffects = (
 
 // ===== Message handling =====
 
-browser.runtime.onMessage.addListener(async (uncastedMessage: unknown) => {
-  const message = uncastedMessage as Message<unknown>;
+browser.runtime.onMessage.addListener(
+  async (uncastedMessage: unknown, sender: browser.Runtime.MessageSender) => {
+    const message = uncastedMessage as Message<unknown>;
 
-  switch (message.type) {
-    case MessageType.GenerateRequest:
-      {
-        const deauthCallback = async () => {
-          await sendMessageToTab(MessageType.GenerateResponse, {
-            error: SIGNED_OUT_CTA_COPY,
-            elementId,
-          });
-          performDeauthSideEffects();
-        };
+    if (message.type === MessageType.OpenSignIn) {
+      const state = await getBrowserStorageValue('clientState');
+      await browser.tabs.create({
+        url:
+          state?.setupUrl === CN_SETUP_URL
+            ? 'https://www.icloud.com.cn/'
+            : 'https://www.icloud.com/',
+      });
+      return;
+    }
 
-        const elementId = message.data;
+    if (
+      message.type !== MessageType.GenerateRequest &&
+      message.type !== MessageType.ReservationRequest
+    ) {
+      return;
+    }
+    if (sender.tab?.id === undefined) return;
 
-        const clientState = await getBrowserStorageValue('clientState');
-        if (clientState === undefined) {
-          await deauthCallback();
-          break;
-        }
+    const isGeneration = message.type === MessageType.GenerateRequest;
+    const elementId = isGeneration
+      ? (message.data as string)
+      : (message.data as ReservationRequestData).elementId;
+    const responseType = isGeneration
+      ? MessageType.GenerateResponse
+      : MessageType.ReservationResponse;
+    const reply = (data: Record<string, unknown>) =>
+      browser.tabs.sendMessage(
+        sender.tab!.id!,
+        {
+          type: responseType,
+          data: { ...data, elementId },
+        },
+        { frameId: sender.frameId }
+      );
 
-        const client = new ICloudClient(
-          clientState.setupUrl,
-          clientState.webservices
-        );
-        const isClientAuthenticated = await client.isAuthenticated();
-        if (!isClientAuthenticated) {
-          await deauthCallback();
-          break;
-        }
-
-        try {
-          const pms = new PremiumMailSettings(client);
-          const hme = await pms.generateHme();
-          await sendMessageToTab(MessageType.GenerateResponse, {
-            hme,
-            elementId,
-          });
-        } catch (e) {
-          await sendMessageToTab(MessageType.GenerateResponse, {
-            error: e.toString(),
-            elementId,
-          });
-        }
+    try {
+      const client = await getAuthenticatedClient();
+      if (!client) {
+        await performDeauthSideEffects();
+        await reply({ error: SIGNED_OUT_CTA_COPY, signedOut: true });
+        return;
       }
-      break;
-    case MessageType.ReservationRequest:
-      {
-        const { hme, label, elementId } =
-          message.data as ReservationRequestData;
-        const client = await constructClient();
-        // Given that the reservation step happens shortly after
-        // the generation step, it is safe to assume that the client's
-        // auth state has been recently validated. Hence, we are
-        // skipping token validation.
-        try {
-          const pms = new PremiumMailSettings(client);
-          await pms.reserveHme(hme, label);
-          await sendMessageToTab(MessageType.ReservationResponse, {
-            hme,
-            elementId,
-          });
-        } catch (e) {
-          await sendMessageToTab(MessageType.ReservationResponse, {
-            error: e.toString(),
-            elementId,
-          });
-        }
+      await performAuthSideEffects(client);
+      const pms = new PremiumMailSettings(client);
+      if (isGeneration) {
+        await reply({ hme: await pms.generateHme() });
+      } else {
+        const { hme, label } = message.data as ReservationRequestData;
+        await pms.reserveHme(hme, label);
+        await reply({ hme });
       }
-      break;
-    default:
-      break;
+    } catch (error) {
+      const signedOut =
+        error instanceof UnsuccessfulRequestError &&
+        error.isAuthenticationError;
+      if (signedOut) await performDeauthSideEffects();
+      await reply({
+        error: signedOut
+          ? SIGNED_OUT_CTA_COPY
+          : 'Couldn’t reach iCloud. Try again.',
+        signedOut,
+      });
+    }
   }
-});
+);
 
 // ===== Context menu =====
 
@@ -175,12 +163,12 @@ const setupContextMenu = async () => {
       visible: options.autofill.contextMenu,
     },
     async () => {
-      const client = await constructClient();
-      const isAuthenticated = await client.isAuthenticated();
-      if (isAuthenticated) {
-        performAuthSideEffects(client);
-      } else {
-        performDeauthSideEffects();
+      try {
+        const client = await getAuthenticatedClient();
+        if (client) await performAuthSideEffects(client);
+        else await performDeauthSideEffects();
+      } catch (error) {
+        console.debug('iCloud session check temporarily unavailable', error);
       }
     }
   );
@@ -242,23 +230,22 @@ browser.contextMenus.onClicked.addListener(async (info, tab) => {
   const serializedUrl = info.pageUrl || tab?.url;
   const hostname = serializedUrl ? new URL(serializedUrl).hostname : '';
 
-  const client = await constructClient();
-  const isClientAuthenticated = await client.isAuthenticated();
-
-  if (!isClientAuthenticated) {
-    sendMessageToTab(
-      MessageType.ActiveInputElementWrite,
-      {
-        text: SIGNED_OUT_CTA_COPY,
-        copyToClipboard: false,
-      } as ActiveInputElementWriteData,
-      tab
-    );
-    performDeauthSideEffects();
-    return;
-  }
-
   try {
+    const client = await getAuthenticatedClient();
+
+    if (!client) {
+      sendMessageToTab(
+        MessageType.ActiveInputElementWrite,
+        {
+          text: SIGNED_OUT_CTA_COPY,
+          copyToClipboard: false,
+        } as ActiveInputElementWriteData,
+        tab
+      );
+      performDeauthSideEffects();
+      return;
+    }
+
     const pms = new PremiumMailSettings(client);
     const hme = await pms.generateHme();
     await pms.reserveHme(hme, hostname);
@@ -284,19 +271,22 @@ browser.contextMenus.onClicked.addListener(async (info, tab) => {
 // The extension needs to be in sync with the icloud.com authentication state of the browser.
 // For example, when the user is authenticated we need to render the context menu item
 // as enabled.
-browser.webRequest.onResponseStarted.addListener(
-  async (details: browser.WebRequest.OnResponseStartedDetailsType) => {
+browser.webRequest.onCompleted.addListener(
+  async (details: browser.WebRequest.OnCompletedDetailsType) => {
     const { statusCode, url } = details;
-    if (statusCode < 200 && statusCode > 299) {
+    if (statusCode < 200 || statusCode > 299) {
       console.debug('Request failed', details);
       return;
     }
 
     const setupUrl = url.split('/accountLogin')[0] as ICloudClient['setupUrl'];
     const client = new ICloudClient(setupUrl);
-    const isAuthenticated = await client.isAuthenticated();
-    if (isAuthenticated) {
-      performAuthSideEffects(client, { notification: true });
+    try {
+      if (await client.isAuthenticated()) {
+        await performAuthSideEffects(client, { notification: true });
+      }
+    } catch (error) {
+      console.debug('iCloud session check temporarily unavailable', error);
     }
   },
   {
@@ -310,15 +300,15 @@ browser.webRequest.onResponseStarted.addListener(
 
 // When the user signs out of their account through icloud.com, we should
 // perform various side effects (e.g. disabling the context menu item)
-browser.webRequest.onResponseStarted.addListener(
-  async (details: browser.WebRequest.OnResponseStartedDetailsType) => {
+browser.webRequest.onCompleted.addListener(
+  async (details: browser.WebRequest.OnCompletedDetailsType) => {
     const { statusCode } = details;
-    if (statusCode < 200 && statusCode > 299) {
+    if (statusCode < 200 || statusCode > 299) {
       console.debug('Request failed', details);
       return;
     }
 
-    performDeauthSideEffects();
+    await performDeauthSideEffects(true);
   },
   {
     urls: [`${DEFAULT_SETUP_URL}/logout*`, `${CN_SETUP_URL}/logout*`],
@@ -334,12 +324,13 @@ browser.webRequest.onResponseStarted.addListener(
 browser.runtime.onInstalled.addListener(
   async (details: browser.Runtime.OnInstalledDetailsType) => {
     if (['install', 'update'].includes(details.reason)) {
-      const client = await constructClient();
-      const isAuthenticated = await client.isAuthenticated();
-      if (isAuthenticated) {
-        performAuthSideEffects(client, { notification: true });
-      } else {
-        performDeauthSideEffects();
+      try {
+        const client = await getAuthenticatedClient();
+        if (client)
+          await performAuthSideEffects(client, { notification: true });
+        else await performDeauthSideEffects();
+      } catch (error) {
+        console.debug('iCloud session check temporarily unavailable', error);
       }
     }
   }

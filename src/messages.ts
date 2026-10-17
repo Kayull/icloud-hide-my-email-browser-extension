@@ -7,6 +7,7 @@ export enum MessageType {
   ReservationRequest,
   ReservationResponse,
   ActiveInputElementWrite,
+  OpenSignIn,
 }
 
 export type Message<T> = {
@@ -24,6 +25,7 @@ export type GenerationResponseData = {
   hme?: string;
   elementId: string;
   error?: string;
+  signedOut?: boolean;
 };
 
 export type ActiveInputElementWriteData = {

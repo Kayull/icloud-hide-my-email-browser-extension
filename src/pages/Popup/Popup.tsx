@@ -55,6 +55,7 @@ import {
   SIGNED_OUT_CTA_COPY,
 } from '../Background/constants';
 import { isFirefox } from '../../browserUtils';
+import { getAuthenticatedClient } from '../../session';
 
 type TransitionCallback<T extends PopupAction> = (action: T) => void;
 
@@ -90,7 +91,9 @@ const SignInInstructions = () => {
           <span className="sr-only">Info</span>
           <div>
             <span className="font-semibold">Pro-tip:</span> Tick the{' '}
-            <span className="font-semibold">Keep me signed in</span> box
+            <span className="font-semibold">Keep me signed in</span> box. The
+            extension reuses your browser’s iCloud session; Apple may still ask
+            you to sign in again when it expires.
           </div>
         </div>
         {isFirefox && (
@@ -801,37 +804,58 @@ const Popup = () => {
   const [clientState, setClientState, isClientStateLoading] =
     useBrowserStorageState('clientState', undefined);
   const [clientAuthStateSynced, setClientAuthStateSynced] = useState(false);
+  const [connectionError, setConnectionError] = useState(false);
 
   useEffect(() => {
-    const syncClientAuthState = async () => {
-      const isAuthenticated =
-        clientState?.setupUrl !== undefined &&
-        (await new ICloudClient(clientState.setupUrl).isAuthenticated());
-
-      if (isAuthenticated) {
-        setState((prevState) =>
-          prevState === PopupState.SignedOut
-            ? PopupState.Authenticated
-            : prevState
-        );
-      } else {
-        setState(PopupState.SignedOut);
-        setClientState(undefined);
-        performDeauthSideEffects();
-      }
-
-      setClientAuthStateSynced(true);
+    const onSessionChange = (
+      changes: Record<string, browser.Storage.StorageChange>,
+      area: string
+    ) => {
+      if (area === 'local' && changes.clientState)
+        setClientAuthStateSynced(false);
     };
+    browser.storage.onChanged.addListener(onSessionChange);
+    return () => browser.storage.onChanged.removeListener(onSessionChange);
+  }, []);
 
-    if (!isClientStateLoading && !clientAuthStateSynced) {
-      syncClientAuthState();
-    }
+  useEffect(() => {
+    if (isClientStateLoading || isStateLoading || clientAuthStateSynced) return;
+    let cancelled = false;
+    const syncClientAuthState = async () => {
+      setConnectionError(false);
+      try {
+        const client = await getAuthenticatedClient();
+        if (cancelled) return;
+        if (client) {
+          setClientState({
+            setupUrl: client.setupUrl,
+            webservices: client.webservices,
+          });
+          setState((previous) =>
+            previous === PopupState.SignedOut
+              ? PopupState.Authenticated
+              : previous
+          );
+        } else {
+          setState(PopupState.SignedOut);
+          await performDeauthSideEffects();
+        }
+      } catch {
+        if (!cancelled) setConnectionError(true);
+      } finally {
+        if (!cancelled) setClientAuthStateSynced(true);
+      }
+    };
+    void syncClientAuthState();
+    return () => {
+      cancelled = true;
+    };
   }, [
     setState,
     setClientState,
     clientAuthStateSynced,
-    clientState?.setupUrl,
     isClientStateLoading,
+    isStateLoading,
   ]);
 
   return (
@@ -839,6 +863,22 @@ const Popup = () => {
       <div className="max-w-md w-full">
         {isStateLoading || !clientAuthStateSynced ? (
           <Spinner />
+        ) : connectionError ? (
+          <TitledComponent
+            title="Hide My Email"
+            subtitle="Connection interrupted"
+          >
+            <p className="text-sm text-gray-600">
+              Couldn’t connect to iCloud. Your saved session has been kept.
+              Check your connection and try again.
+            </p>
+            <LoadingButton
+              loading={false}
+              onClick={() => setClientAuthStateSynced(false)}
+            >
+              Try again
+            </LoadingButton>
+          </TitledComponent>
         ) : (
           transitionToNextStateElement(state, setState, clientState)
         )}

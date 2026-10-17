@@ -12,6 +12,7 @@ import {
 import startCase from 'lodash.startcase';
 import isEqual from 'lodash.isequal';
 import { DEFAULT_STORE } from '../../storage';
+import { getAuthenticatedClient } from '../../session';
 
 const SELECT_FWD_TO_SIGNED_OUT_CTA_COPY =
   'To select a new Forward-To address, you first need to sign-in by following the instructions on the extension pop-up.';
@@ -23,29 +24,22 @@ const SelectFwdToForm = () => {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [listHmeError, setListHmeError] = useState<string>();
   const [updateFwdToError, setUpdateFwdToError] = useState<string>();
-  const [clientState, setClientState, isClientStateLoading] =
-    useBrowserStorageState('clientState', undefined);
+  const [clientState, , isClientStateLoading] = useBrowserStorageState(
+    'clientState',
+    undefined
+  );
 
   useEffect(() => {
     const fetchHmeList = async () => {
       setListHmeError(undefined);
       setIsFetching(true);
 
-      if (clientState?.setupUrl === undefined) {
-        setListHmeError(SELECT_FWD_TO_SIGNED_OUT_CTA_COPY);
-        setIsFetching(false);
-        return;
-      }
-
-      const client = new ICloudClient(clientState.setupUrl);
-      const isClientAuthenticated = await client.isAuthenticated();
-      if (!isClientAuthenticated) {
-        setListHmeError(SELECT_FWD_TO_SIGNED_OUT_CTA_COPY);
-        setIsFetching(false);
-        return;
-      }
-
       try {
+        const client = await getAuthenticatedClient();
+        if (!client) {
+          setListHmeError(SELECT_FWD_TO_SIGNED_OUT_CTA_COPY);
+          return;
+        }
         const pms = new PremiumMailSettings(client);
         const result = await pms.listHme();
         setFwdToEmails((prevState) =>
@@ -64,7 +58,7 @@ const SelectFwdToForm = () => {
     if (!isClientStateLoading) {
       fetchHmeList();
     }
-  }, [setClientState, clientState?.setupUrl, isClientStateLoading]);
+  }, [clientState?.setupUrl, isClientStateLoading]);
 
   const onSelectedFwdToSubmit = async (
     event: React.FormEvent<HTMLFormElement>

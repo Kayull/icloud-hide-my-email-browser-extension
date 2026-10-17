@@ -86,6 +86,34 @@ Note: the following console commands are to be executed from the root directory 
 | 7 | Publish | [Chrome webstore dev console](https://chrome.google.com/webstore/devconsole/) | [Mozilla Add-on developer hub](https://addons.mozilla.org/en-US/developers/addon/icloud-hide-my-email/versions/submit/) |
 <!-- prettier-ignore-end -->
 
+### Session handling and checks
+
+The extension uses the iCloud cookies already held by your browser, including
+cookie updates returned by iCloud. It does not copy cookies into extension storage
+or change their expiry dates. Session validation refreshes the Hide My Email
+service address; temporary network errors, timeouts, rate limits, and server
+errors leave the saved session intact and offer a retry. An existing iCloud sign-in
+can also be recovered when extension session metadata is missing.
+
+When signing in on iCloud.com, select **Keep me signed in** and trust the browser
+if prompted. Apple can still expire or revoke the session; sign in again when
+that happens. Use the same browser profile (and, on Firefox, a tab outside a
+container). Clearing iCloud cookies also ends the session.
+
+To run the session and browser regression checks:
+
+```sh
+npx playwright install chromium
+npm test
+npx tsc --noEmit
+npm run lint
+```
+
+After building, reload the unpacked extension and refresh existing website tabs
+to replace their old content scripts. The inline control supports light and dark
+mode; press Down Arrow from a focused email field to reach the control and Escape
+to dismiss it. The autofill setting applies to already-open tabs.
+
 ### TODOs
 
 - [ ] Ability to modify the label and note of existing HME addresses

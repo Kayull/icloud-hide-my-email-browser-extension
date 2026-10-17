@@ -4,307 +4,333 @@ import {
   Message,
   MessageType,
   ReservationRequestData,
-  ReservationResponseData,
 } from '../../messages';
 import { v4 as uuidv4 } from 'uuid';
 import './index.css';
 import browser from 'webextension-polyfill';
-import { getBrowserStorageValue } from '../../storage';
+import { getBrowserStorageValue, Options } from '../../storage';
+import { AUTOFILL_STYLES } from './styles';
 
-const EMAIL_INPUT_QUERY_STRING =
-  'input[type="email"], input[name="email"], input[id="email"]';
-
-const LOADING_COPY = 'Hide My Email — Loading...';
-
-// A unique CSS class prefix is used to guarantee that the style injected
-// by the extension does not interfere with the existing style of
-// a web page.
-const STYLE_CLASS_PREFIX = 'd1691f0f-b8f0-495e-9ffb-fe4e6f84b518';
-
-const className = (shortName: string): string =>
-  `${STYLE_CLASS_PREFIX}-${shortName}`;
-
-type AutofillableInputElement = {
-  inputElement: HTMLInputElement;
-  buttonSupport?: {
-    btnElement: HTMLButtonElement;
-    inputOnFocusCallback: (ev: FocusEvent) => void;
-    inputOnBlurCallback: (ev: FocusEvent) => void;
-    btnOnMousedownCallback: (ev: MouseEvent) => void;
-  };
+const EMAIL_INPUT_QUERY =
+  'input[type="email"], input[name="email"], input[id="email"], input[autocomplete="email"]';
+const HOST_CLASS = 'd1691f0f-b8f0-495e-9ffb-fe4e6f84b518-host';
+const controllerWindow = window as Window & {
+  __icloudHmeCleanup?: () => void;
 };
 
-const disableButton = (
-  btn: HTMLButtonElement,
-  cursorClass: string,
-  copy: string
-): void => {
-  btn.innerHTML = copy;
-  btn.setAttribute('disabled', 'true');
-  btn.classList.remove(className('hover-button'));
-  btn.classList.forEach((name) => {
-    if (name.startsWith(className('cursor-'))) {
-      btn.classList.remove(name);
-    }
-  });
-  btn.classList.add(className(cursorClass));
-};
+type ButtonState = 'loading' | 'ready' | 'signed-out' | 'error' | 'reserving';
 
-const enableButton = (
-  btn: HTMLButtonElement,
-  cursorClass: string,
-  copy: string
-): void => {
-  btn.innerHTML = copy;
-  btn.removeAttribute('disabled');
-  btn.classList.add(className('hover-button'));
-  btn.classList.forEach((name) => {
-    if (name.startsWith(className('cursor-'))) {
-      btn.classList.remove(name);
-    }
-  });
-  btn.classList.add(className(cursorClass));
-};
-
-const makeButtonSupport = (
-  inputElement: HTMLInputElement
-): AutofillableInputElement['buttonSupport'] => {
-  const btnElement = document.createElement('button');
-  const btnElementId = uuidv4();
-  btnElement.setAttribute('id', btnElementId);
-  btnElement.setAttribute('type', 'button');
-  btnElement.classList.add(className('button'));
-
-  disableButton(btnElement, 'cursor-not-allowed', LOADING_COPY);
-
-  const inputOnFocusCallback = async () => {
-    disableButton(btnElement, 'cursor-progress', LOADING_COPY);
-    inputElement.parentNode?.insertBefore(btnElement, inputElement.nextSibling);
-
-    await browser.runtime.sendMessage({
-      type: MessageType.GenerateRequest,
-      data: btnElementId,
-    });
-  };
-
-  inputElement.addEventListener('focus', inputOnFocusCallback);
-
-  const inputOnBlurCallback = () => {
-    disableButton(btnElement, 'cursor-not-allowed', LOADING_COPY);
-    btnElement.remove();
-  };
-
-  inputElement.addEventListener('blur', inputOnBlurCallback);
-
-  const btnOnMousedownCallback = async (ev: MouseEvent) => {
-    ev.preventDefault();
-    const hme = btnElement.innerHTML;
-    disableButton(btnElement, 'cursor-progress', LOADING_COPY);
-    await browser.runtime.sendMessage({
-      type: MessageType.ReservationRequest,
-      data: { hme, label: window.location.host, elementId: btnElement.id },
-    } as Message<ReservationRequestData>);
-  };
-
-  btnElement.addEventListener('mousedown', btnOnMousedownCallback);
-
-  return {
-    btnElement,
-    inputOnFocusCallback,
-    inputOnBlurCallback,
-    btnOnMousedownCallback,
-  };
-};
-
-const removeButtonSupport = (
-  inputElement: HTMLInputElement,
-  buttonSupport: NonNullable<AutofillableInputElement['buttonSupport']>
-): void => {
-  const { btnElement, inputOnFocusCallback, inputOnBlurCallback } =
-    buttonSupport;
-  inputElement.removeEventListener('focus', inputOnFocusCallback);
-  inputElement.removeEventListener('blur', inputOnBlurCallback);
-  btnElement.remove();
-};
+function fillInput(input: HTMLInputElement, value: string): void {
+  // Use the native setter so controlled inputs (including React) see the change.
+  const setter = Object.getOwnPropertyDescriptor(
+    HTMLInputElement.prototype,
+    'value'
+  )?.set;
+  setter?.call(input, value);
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+  input.dispatchEvent(new Event('change', { bubbles: true }));
+}
 
 export default async function main(): Promise<void> {
-  const emailInputElements = document.querySelectorAll<HTMLInputElement>(
-    EMAIL_INPUT_QUERY_STRING
-  );
+  // Content scripts can be reinjected. Dispose the previous controller first.
+  controllerWindow.__icloudHmeCleanup?.();
+  let disposed = false;
+  let enabled = true;
+  let activeInput: HTMLInputElement | undefined;
+  let requestId = '';
+  let state: ButtonState = 'loading';
+  let hme: string | undefined;
+  let onCleanup = () => {
+    disposed = true;
+  };
+  const cleanup = () => onCleanup();
+  controllerWindow.__icloudHmeCleanup = cleanup;
 
   const options = await getBrowserStorageValue('iCloudHmeOptions');
+  if (disposed) return;
+  enabled = options?.autofill.button !== false;
 
-  const makeAutofillableInputElement = (
-    inputElement: HTMLInputElement
-  ): AutofillableInputElement => ({
-    inputElement,
-    buttonSupport:
-      options?.autofill.button === false
-        ? undefined
-        : makeButtonSupport(inputElement),
-  });
+  // A single shared control prevents duplicate buttons, even on dynamic forms.
+  const host = document.createElement('div');
+  host.className = HOST_CLASS;
+  host.hidden = true;
+  const shadow = host.attachShadow({ mode: 'closed' });
+  const style = document.createElement('style');
+  style.textContent = AUTOFILL_STYLES;
+  const button = document.createElement('button');
+  button.type = 'button';
+  const icon = document.createElement('span');
+  icon.className = 'icon';
+  icon.setAttribute('aria-hidden', 'true');
+  icon.textContent = '✉';
+  const copy = document.createElement('span');
+  copy.className = 'copy';
+  const title = document.createElement('span');
+  title.className = 'title';
+  const detail = document.createElement('span');
+  detail.className = 'detail';
+  detail.setAttribute('aria-live', 'polite');
+  const action = document.createElement('span');
+  action.className = 'action';
+  action.setAttribute('aria-hidden', 'true');
+  copy.append(title, detail);
+  button.append(icon, copy, action);
+  shadow.append(style, button);
+  document.documentElement.append(host);
 
-  const autofillableInputElements = Array.from(emailInputElements).map(
-    makeAutofillableInputElement
-  );
+  const render = (next: ButtonState, error?: string) => {
+    state = next;
+    const busy = state === 'loading' || state === 'reserving';
+    // Native disabling drops keyboard focus and can lose the reservation target.
+    button.setAttribute('aria-disabled', String(busy));
+    button.dataset.state = state;
+    button.setAttribute('aria-busy', String(busy));
+    title.textContent =
+      state === 'signed-out' ? 'Connect to iCloud' : 'Hide My Email';
+    detail.textContent = {
+      loading: 'Connecting to iCloud…',
+      reserving: 'Creating your private address…',
+      ready: hme || '',
+      'signed-out': 'Sign in to create a private address',
+      error: error || 'Couldn’t reach iCloud. Try again.',
+    }[state];
+    action.textContent = {
+      loading: '•••',
+      reserving: '•••',
+      ready: 'Use',
+      'signed-out': 'Sign in ↗',
+      error: 'Retry ↻',
+    }[state];
+    button.title = state === 'ready' ? `Use ${hme}` : detail.textContent;
+  };
 
-  const mutationCallback: MutationCallback = (mutations) => {
-    mutations.forEach((mutation) => {
-      mutation.addedNodes.forEach((node) => {
-        if (!(node instanceof Element)) {
-          return;
-        }
+  const hide = () => {
+    host.hidden = true;
+    activeInput = undefined;
+    requestId = '';
+  };
 
-        const addedElements = node.querySelectorAll<HTMLInputElement>(
-          EMAIL_INPUT_QUERY_STRING
-        );
-        addedElements.forEach((el) => {
-          const elementExists = autofillableInputElements.some((item) =>
-            el.isEqualNode(item.inputElement)
-          );
-          if (!elementExists) {
-            autofillableInputElements.push(makeAutofillableInputElement(el));
-          }
-        });
+  const position = () => {
+    if (!activeInput || host.hidden) return;
+    if (
+      !activeInput.isConnected ||
+      activeInput.disabled ||
+      activeInput.readOnly
+    ) {
+      hide();
+      return;
+    }
+    const rect = activeInput.getBoundingClientRect();
+    if (
+      !rect.width ||
+      !rect.height ||
+      rect.bottom < 0 ||
+      rect.top > innerHeight
+    ) {
+      hide();
+      return;
+    }
+    const width = Math.min(360, Math.max(240, rect.width), innerWidth - 16);
+    const left = Math.max(8, Math.min(rect.left, innerWidth - width - 8));
+    host.style.setProperty('width', `${width}px`, 'important');
+    host.style.setProperty('left', `${left}px`, 'important');
+    const height = host.getBoundingClientRect().height;
+    host.style.setProperty(
+      'top',
+      `${Math.max(
+        8,
+        rect.bottom + height + 8 > innerHeight
+          ? rect.top - height - 6
+          : rect.bottom + 6
+      )}px`,
+      'important'
+    );
+  };
+
+  const generate = async () => {
+    requestId = uuidv4();
+    const id = requestId;
+    hme = undefined;
+    render('loading');
+    try {
+      await browser.runtime.sendMessage({
+        type: MessageType.GenerateRequest,
+        data: id,
       });
+    } catch {
+      if (requestId === id)
+        render('error', 'Extension updated. Reload this page to reconnect.');
+    }
+  };
 
-      mutation.removedNodes.forEach((node) => {
-        if (!(node instanceof Element)) {
-          return;
-        }
+  const onFocus = (event: FocusEvent) => {
+    const input = event.target;
+    if (input === host) return;
+    if (
+      !enabled ||
+      !(input instanceof HTMLInputElement) ||
+      !input.matches(EMAIL_INPUT_QUERY) ||
+      input.disabled ||
+      input.readOnly
+    ) {
+      hide();
+      return;
+    }
+    if (activeInput === input && !host.hidden) return;
+    activeInput = input;
+    host.hidden = false;
+    render('loading');
+    position();
+    void generate();
+  };
 
-        const removedElements = node.querySelectorAll<HTMLInputElement>(
-          EMAIL_INPUT_QUERY_STRING
-        );
-        removedElements.forEach((el) => {
-          const foundIndex = autofillableInputElements.findIndex((item) =>
-            el.isEqualNode(item.inputElement)
-          );
-          if (foundIndex !== -1) {
-            const [{ inputElement, buttonSupport }] =
-              autofillableInputElements.splice(foundIndex, 1);
-
-            if (buttonSupport) {
-              removeButtonSupport(inputElement, buttonSupport);
-            }
-          }
-        });
-      });
+  const onBlur = () => {
+    // Let focus reach the control before deciding whether to dismiss it.
+    queueMicrotask(() => {
+      if (document.activeElement !== activeInput && !shadow.activeElement)
+        hide();
     });
   };
 
-  const observer = new MutationObserver(mutationCallback);
-  observer.observe(document.body, {
-    childList: true,
-    attributes: false,
-    subtree: true,
+  button.addEventListener('mousedown', (event) => {
+    // Keep the input focused for pointer use; native clicks also support keyboard use.
+    if (event.button === 0) event.preventDefault();
   });
-
-  browser.runtime.onMessage.addListener((uncastedMessage: unknown) => {
-    const message = uncastedMessage as Message<unknown>;
-
-    switch (message.type) {
-      case MessageType.Autofill:
-        autofillableInputElements.forEach(({ inputElement, buttonSupport }) => {
-          inputElement.value = message.data as string;
-          inputElement.dispatchEvent(new Event('input', { bubbles: true }));
-          if (buttonSupport) {
-            removeButtonSupport(inputElement, buttonSupport);
-          }
-        });
-        break;
-      case MessageType.GenerateResponse:
-        {
-          const { hme, elementId, error } =
-            message.data as GenerationResponseData;
-
-          const element = document.getElementById(elementId);
-
-          if (!element || !(element instanceof HTMLButtonElement)) {
-            break;
-          }
-
-          if (error) {
-            disableButton(element, 'cursor-not-allowed', error);
-            break;
-          }
-
-          if (!hme) {
-            break;
-          }
-
-          enableButton(element, 'cursor-pointer', hme);
-        }
-        break;
-      case MessageType.ReservationResponse:
-        {
-          const { hme, error, elementId } =
-            message.data as ReservationResponseData;
-
-          const btnElement = document.getElementById(elementId);
-
-          if (!btnElement || !(btnElement instanceof HTMLButtonElement)) {
-            break;
-          }
-
-          if (error) {
-            disableButton(btnElement, 'cursor-not-allowed', error);
-            break;
-          }
-
-          if (!hme) {
-            break;
-          }
-
-          const found = autofillableInputElements.find(
-            (ael) => ael.buttonSupport?.btnElement.id === btnElement.id
-          );
-          if (!found) {
-            break;
-          }
-
-          const { inputElement, buttonSupport } = found;
-          inputElement.value = hme;
-          inputElement.dispatchEvent(new Event('input', { bubbles: true }));
-          inputElement.dispatchEvent(new Event('change', { bubbles: true }));
-
-          if (buttonSupport) {
-            removeButtonSupport(inputElement, buttonSupport);
-          }
-        }
-        break;
-      case MessageType.ActiveInputElementWrite:
-        {
-          const { activeElement } = document;
-          if (!activeElement || !(activeElement instanceof HTMLInputElement)) {
-            break;
-          }
-
-          const {
-            data: { text, copyToClipboard },
-          } = message as Message<ActiveInputElementWriteData>;
-          activeElement.value = text;
-          activeElement.dispatchEvent(new Event('input', { bubbles: true }));
-          activeElement.dispatchEvent(new Event('change', { bubbles: true }));
-          if (copyToClipboard) {
-            navigator.clipboard.writeText(text);
-          }
-
-          // Remove button if it exists. This should rarely happen as context menu
-          // users are expected to have turned off button support.
-          const found = autofillableInputElements.find((ael) =>
-            ael.inputElement.isEqualNode(activeElement)
-          );
-          const buttonSupport = found?.buttonSupport;
-          if (buttonSupport) {
-            removeButtonSupport(activeElement, buttonSupport);
-          }
-        }
-        break;
-      default:
-        break;
+  button.addEventListener('click', async () => {
+    if (!activeInput || state === 'loading' || state === 'reserving') return;
+    if (state === 'signed-out') {
+      try {
+        await browser.runtime.sendMessage({ type: MessageType.OpenSignIn });
+      } catch {
+        render('error', 'Extension updated. Reload this page to reconnect.');
+      }
+      return;
     }
-
-    return undefined;
+    if (state === 'error') {
+      await generate();
+      return;
+    }
+    if (!hme) return;
+    render('reserving');
+    const id = requestId;
+    try {
+      await browser.runtime.sendMessage({
+        type: MessageType.ReservationRequest,
+        data: { hme, label: location.host, elementId: id },
+      } as Message<ReservationRequestData>);
+    } catch {
+      if (requestId === id) render('error');
+    }
   });
+
+  const onKeydown = (event: KeyboardEvent) => {
+    if (host.hidden) return;
+    if (
+      event.key === 'ArrowDown' &&
+      event.target === activeInput &&
+      state !== 'loading' &&
+      state !== 'reserving'
+    ) {
+      event.preventDefault();
+      button.focus();
+    }
+    if (event.key === 'Escape') {
+      activeInput?.focus();
+      hide();
+    }
+  };
+
+  const onMessage = (raw: unknown) => {
+    const message = raw as Message<unknown>;
+    if (message.type === MessageType.Autofill) {
+      document
+        .querySelectorAll<HTMLInputElement>(EMAIL_INPUT_QUERY)
+        .forEach((input) => {
+          if (!input.disabled && !input.readOnly)
+            fillInput(input, message.data as string);
+        });
+      hide();
+    } else if (message.type === MessageType.ActiveInputElementWrite) {
+      const input = document.activeElement;
+      if (!(input instanceof HTMLInputElement)) return;
+      const { text, copyToClipboard } =
+        message.data as ActiveInputElementWriteData;
+      fillInput(input, text);
+      if (copyToClipboard)
+        void navigator.clipboard.writeText(text).catch(console.debug);
+      hide();
+    } else if (
+      message.type === MessageType.GenerateResponse ||
+      message.type === MessageType.ReservationResponse
+    ) {
+      const data = message.data as GenerationResponseData;
+      if (data.elementId !== requestId || !activeInput?.isConnected) return;
+      if (data.error) {
+        render(data.signedOut ? 'signed-out' : 'error', data.error);
+      } else if (data.hme) {
+        if (message.type === MessageType.ReservationResponse) {
+          fillInput(activeInput, data.hme);
+          activeInput.focus();
+          hide();
+        } else {
+          hme = data.hme;
+          render('ready');
+        }
+      } else {
+        render('error');
+      }
+      position();
+    }
+  };
+
+  const onStorageChange = (
+    changes: Record<string, browser.Storage.StorageChange>,
+    area: string
+  ) => {
+    if (area !== 'local') return;
+    if (changes.iCloudHmeOptions) {
+      enabled =
+        (changes.iCloudHmeOptions.newValue as Options | undefined)?.autofill
+          .button !== false;
+      if (!enabled) hide();
+    }
+    if (changes.clientState && activeInput) {
+      if (!changes.clientState.newValue) {
+        requestId = uuidv4();
+        hme = undefined;
+        render('signed-out');
+      } else if (state === 'signed-out') {
+        void generate();
+      }
+    }
+  };
+  const observer = new MutationObserver(position);
+  observer.observe(document.documentElement, {
+    subtree: true,
+    childList: true,
+  });
+  document.addEventListener('focusin', onFocus);
+  document.addEventListener('focusout', onBlur);
+  document.addEventListener('keydown', onKeydown);
+  document.addEventListener('scroll', position, true);
+  window.addEventListener('resize', position);
+  browser.runtime.onMessage.addListener(onMessage);
+  browser.storage.onChanged.addListener(onStorageChange);
+
+  onCleanup = () => {
+    disposed = true;
+    hide();
+    observer.disconnect();
+    document.removeEventListener('focusin', onFocus);
+    document.removeEventListener('focusout', onBlur);
+    document.removeEventListener('keydown', onKeydown);
+    document.removeEventListener('scroll', position, true);
+    window.removeEventListener('resize', position);
+    browser.runtime.onMessage.removeListener(onMessage);
+    browser.storage.onChanged.removeListener(onStorageChange);
+    host.remove();
+  };
+  if (document.activeElement instanceof HTMLInputElement) {
+    onFocus({ target: document.activeElement } as unknown as FocusEvent);
+  }
 }

@@ -6,6 +6,7 @@ import {
   useCallback,
 } from 'react';
 import isEqual from 'lodash.isequal';
+import browser from 'webextension-polyfill';
 import {
   getBrowserStorageValue,
   setBrowserStorageValue,
@@ -20,11 +21,26 @@ export function useBrowserStorageState<K extends keyof Store>(
   const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
+    let mounted = true;
+    const onChange = (
+      changes: Record<string, browser.Storage.StorageChange>,
+      area: string
+    ) => {
+      if (area === 'local' && changes[key]) {
+        const value = changes[key].newValue as Store[K] | undefined;
+        setState((previous) =>
+          isEqual(previous, value ?? initialValue)
+            ? previous
+            : value ?? initialValue
+        );
+      }
+    };
+    browser.storage.onChanged.addListener(onChange);
     async function getBrowserStorageState() {
       setIsLoading(true);
       const value = await getBrowserStorageValue(key);
 
-      if (value !== undefined) {
+      if (mounted && value !== undefined) {
         setState((prevState) =>
           isEqual(prevState, value) ? prevState : value
         );
@@ -33,14 +49,21 @@ export function useBrowserStorageState<K extends keyof Store>(
 
     getBrowserStorageState()
       .catch(console.error)
-      .finally(() => setIsLoading(false));
-  }, [key]);
+      .finally(() => {
+        if (mounted) setIsLoading(false);
+      });
+    return () => {
+      mounted = false;
+      browser.storage.onChanged.removeListener(onChange);
+    };
+  }, [key, initialValue]);
 
   const setBrowserStorageState = useCallback(
     (value: SetStateAction<Store[K]>) =>
       setState((prevState) => {
         const newValue = value instanceof Function ? value(prevState) : value;
-        setBrowserStorageValue(key, newValue);
+        if (isEqual(prevState, newValue)) return prevState;
+        void setBrowserStorageValue(key, newValue).catch(console.error);
         return newValue;
       }),
     [key]
