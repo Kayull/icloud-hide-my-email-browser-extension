@@ -2,8 +2,10 @@
 process.env.NODE_ENV = 'development';
 process.env.ASSET_PATH = '/';
 
-var WebpackDevServer = require('webpack-dev-server'),
+var express = require('express'),
   webpack = require('webpack'),
+  webpackDevMiddleware = require('webpack-dev-middleware'),
+  webpackHotMiddleware = require('webpack-hot-middleware'),
   config = require('../webpack.config'),
   path = require('path'),
   PORT = process.env.PORT || 3000;
@@ -14,8 +16,7 @@ var excludeEntriesToHotReload = options.notHotReload || [];
 for (var entryName in config.entry) {
   if (excludeEntriesToHotReload.indexOf(entryName) === -1) {
     config.entry[entryName] = [
-      'webpack/hot/dev-server',
-      `webpack-dev-server/client/index.js?hot=true&hostname=localhost&port=${PORT}`,
+      'webpack-hot-middleware/client?path=/__webpack_hmr&timeout=20000&reload=true',
     ].concat(config.entry[entryName]);
   }
 }
@@ -27,32 +28,22 @@ config.plugins = [new webpack.HotModuleReplacementPlugin()].concat(
 delete config.chromeExtensionBoilerplate;
 
 var compiler = webpack(config);
+var app = express();
 
-var server = new WebpackDevServer(
-  {
-    hot: false,
-    client: false,
-    host: 'localhost',
-    port: PORT,
-    static: {
-      directory: path.join(__dirname, '../build'),
-    },
-    devMiddleware: {
-      publicPath: `http://localhost:${PORT}/`,
-      writeToDisk: true,
-    },
-    headers: {
-      'Access-Control-Allow-Origin': '*',
-    },
-    allowedHosts: 'all',
-  },
-  compiler
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  next();
+});
+
+app.use(
+  webpackDevMiddleware(compiler, {
+    publicPath: config.output.publicPath,
+    writeToDisk: true,
+  })
 );
+app.use(webpackHotMiddleware(compiler, { path: '/__webpack_hmr' }));
+app.use(express.static(path.join(__dirname, '../build')));
 
-if (process.env.NODE_ENV === 'development' && module.hot) {
-  module.hot.accept();
-}
-
-(async () => {
-  await server.start();
-})();
+app.listen(PORT, 'localhost', () => {
+  console.log(`Development server listening at http://localhost:${PORT}`);
+});
