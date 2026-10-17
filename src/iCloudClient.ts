@@ -35,7 +35,9 @@ class ICloudClient {
       cache: 'no-store',
       signal: AbortSignal.timeout(15000),
       headers,
-      body: data !== undefined ? JSON.stringify(data) : undefined,
+      ...(method === 'POST' && data !== undefined
+        ? { body: JSON.stringify(data) }
+        : {}),
     });
 
     if (!response.ok) {

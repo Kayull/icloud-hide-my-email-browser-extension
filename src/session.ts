@@ -1,4 +1,4 @@
-import isEqual from 'lodash.isequal';
+import isEqual from 'fast-deep-equal/es6';
 import ICloudClient, { CN_SETUP_URL, DEFAULT_SETUP_URL } from './iCloudClient';
 import { getBrowserStorageValue, setBrowserStorageValue } from './storage';
 

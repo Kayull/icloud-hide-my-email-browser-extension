@@ -4,7 +4,6 @@ const webpack = require('webpack'),
   HtmlWebpackPlugin = require('html-webpack-plugin'),
   TerserPlugin = require('terser-webpack-plugin'),
   MiniCssExtractPlugin = require('mini-css-extract-plugin'),
-  { CleanWebpackPlugin } = require('clean-webpack-plugin'),
   ASSET_PATH = process.env.ASSET_PATH || '/',
   FIREFOX = process.env.FIREFOX === 'true';
 
@@ -33,14 +32,12 @@ const applyFirefoxManifestTransformations = (manifest) => {
     background: {
       scripts: [service_worker],
     },
-    ...{
-      browser_specific_settings: {
-        gecko: {
-          id: '{5f2806a5-f66d-40c6-8fb2-6018753b5626}',
-          // Minimum version of Firefox that supports declarativeNetRequest:
-          // https://blog.mozilla.org/addons/2023/05/17/declarativenetrequest-available-in-firefox/
-          strict_min_version: '113.0',
-        },
+    browser_specific_settings: {
+      gecko: {
+        id: '{5f2806a5-f66d-40c6-8fb2-6018753b5626}',
+        // Minimum version of Firefox that supports declarativeNetRequest:
+        // https://blog.mozilla.org/addons/2023/05/17/declarativenetrequest-available-in-firefox/
+        strict_min_version: '113.0',
       },
     },
   };
@@ -112,7 +109,6 @@ const options = {
   },
   plugins: [
     new MiniCssExtractPlugin(),
-    new CleanWebpackPlugin({ verbose: false }),
     new webpack.ProgressPlugin(),
     // expose and write the allowed env vars on the compiled bundle
     new webpack.EnvironmentPlugin(['NODE_ENV']),

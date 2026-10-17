@@ -10,7 +10,7 @@ import {
   Link,
 } from '../../commonComponents';
 import startCase from 'lodash.startcase';
-import isEqual from 'lodash.isequal';
+import isEqual from 'fast-deep-equal/es6';
 import { DEFAULT_STORE } from '../../storage';
 import { getAuthenticatedClient } from '../../session';
 

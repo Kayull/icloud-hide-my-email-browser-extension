@@ -42,7 +42,7 @@ import { setBrowserStorageValue, Store } from '../../storage';
 
 import browser from 'webextension-polyfill';
 import Fuse from 'fuse.js';
-import isEqual from 'lodash.isequal';
+import isEqual from 'fast-deep-equal/es6';
 import {
   PopupAction,
   PopupState,

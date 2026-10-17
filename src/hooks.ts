@@ -5,7 +5,7 @@ import {
   SetStateAction,
   useCallback,
 } from 'react';
-import isEqual from 'lodash.isequal';
+import isEqual from 'fast-deep-equal/es6';
 import browser from 'webextension-polyfill';
 import {
   getBrowserStorageValue,
