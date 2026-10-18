@@ -56,6 +56,18 @@ function mockBrowser(initial = {}) {
       getURL: (p) => `chrome-extension://test/${p}`,
       onMessage: event(),
       onInstalled: event(),
+      onStartup: event(),
+    },
+    cookies: {
+      getAllCookieStores: async () => [{ id: '0' }],
+      getAll: async () => [],
+      set: async (details) => details,
+      onChanged: event(),
+    },
+    alarms: {
+      get: async () => undefined,
+      create: async () => {},
+      onAlarm: event(),
     },
     tabs: { sendMessage: async () => {}, create: async () => {} },
     contextMenus: {

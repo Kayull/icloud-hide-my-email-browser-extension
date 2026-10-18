@@ -29,6 +29,13 @@ import {
 } from './constants';
 import { isFirefox } from '../../browserUtils';
 import { getAuthenticatedClient } from '../../session';
+import {
+  KEEP_ALIVE_ALARM_NAME,
+  KEEP_ALIVE_PERIOD_MINUTES,
+  isICloudCookie,
+  persistCookie,
+  persistSessionCookies,
+} from '../../sessionPersistence';
 
 const performDeauthSideEffects = async (clearSession = false) => {
   await setBrowserStorageValue('popupState', DEFAULT_STORE.popupState);
@@ -315,6 +322,45 @@ browser.webRequest.onCompleted.addListener(
   },
   []
 );
+
+// ===== Session persistence =====
+
+// Sessions created without "Keep me signed in" (e.g. passkey sign-ins) only get
+// browser-session cookies. Promote them to persistent cookies as soon as iCloud
+// sets them, so the session survives a browser restart.
+browser.cookies.onChanged.addListener(({ removed, cookie }) => {
+  if (removed || !cookie.session || !isICloudCookie(cookie)) return;
+  persistCookie(cookie).catch(console.debug);
+});
+
+// Periodically validate the session so iCloud keeps refreshing its tokens
+// rather than letting an idle session lapse.
+const keepSessionAlive = async () => {
+  try {
+    const client = await getAuthenticatedClient();
+    if (client) await performAuthSideEffects(client);
+    else await performDeauthSideEffects();
+  } catch (error) {
+    console.debug('iCloud session check temporarily unavailable', error);
+  }
+};
+
+browser.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === KEEP_ALIVE_ALARM_NAME) keepSessionAlive();
+});
+
+const ensureKeepAliveAlarm = async () => {
+  if (!(await browser.alarms.get(KEEP_ALIVE_ALARM_NAME))) {
+    await browser.alarms.create(KEEP_ALIVE_ALARM_NAME, {
+      periodInMinutes: KEEP_ALIVE_PERIOD_MINUTES,
+    });
+  }
+};
+
+ensureKeepAliveAlarm().catch(console.debug);
+persistSessionCookies().catch(console.debug);
+
+browser.runtime.onStartup.addListener(keepSessionAlive);
 
 // ===== Post installation hooks =====
 
